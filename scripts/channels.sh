@@ -1578,7 +1578,9 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
       sleep 1
       continue
       ;;
-    *"Listening for channel messages"*)
+    # 2.1.296 dropped "channel" and the colon from the ready banner
+    # ("Listening for messages from <x>"); match both wordings.
+    *"Listening for channel messages"*|*"Listening for messages from"*)
       break
       ;;
   esac

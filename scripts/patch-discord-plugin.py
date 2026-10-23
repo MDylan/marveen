@@ -25,7 +25,9 @@ before the plugin is spawned, over every cached plugin version in ONE cache:
 the one this install launches from ($CLAUDE_CONFIG_DIR/plugins/cache, or
 ~/.claude/plugins/cache when the variable is unset).
 
-- idempotent: a file carrying the marker is left alone;
+- idempotent: a file carrying the marker is left alone, unless this script's
+  code changed since: then the old lines are taken out and the current ones
+  put in ("upgraded");
 - all-or-nothing: if ANY anchor is missing or not unique (a plugin update
   changed the code), the file is left unchanged and one loud line says so --
   the reply tool then has no buttons, everything else works as before;
@@ -114,12 +116,15 @@ function buildButtonRows(raw: unknown): ActionRowBuilder<ButtonBuilder>[] {
   return rows
 }
 
-// Who may answer with a button. DMs: only allowFrom, like messages. Guild
+// Who may answer with a button: gate() for messages, minus the mention.
+// Inbound switched off (dmPolicy disabled) drops clicks too, so buttons sent
+// before that stop being answerable. DMs: only allowFrom, like messages. Guild
 // channels: the channel must be opted in and groupAllowFrom (if set) applies.
 // In a channel that listens to every message (requireMention: false) anyone
 // there may click; otherwise only allowFrom / groupAllowFrom members, because
 // a click carries no mention to gate on.
 function clickAllowed(interaction: Interaction, access: Access): boolean {
+  if (access.dmPolicy === 'disabled') return false
   const userId = interaction.user.id
   if (interaction.guildId === null) return access.allowFrom.includes(userId)
   const ch = interaction.channel
@@ -189,6 +194,36 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 
 """
 
+# The names the inserted code uses from the plugin. An anchor only proves the
+# code next to the insertion is still there; if a later version renamed or
+# dropped one of these, the patched file would still say "patched" and then
+# fail: a top-level ButtonStyle reference throws ReferenceError when the module
+# loads, so the channel would not start at all. Missing -> the same loud
+# "left out" path as a moved anchor.
+DISCORD_IMPORT = re.compile(r"^import \{\n((?:[^\n]*\n)*?)\} from 'discord\.js'\n", re.MULTILINE)
+
+
+def _imports(*names):
+    def ok(text):
+        m = DISCORD_IMPORT.search(text)
+        return bool(m) and all(re.search(rf"^\s*(?:type\s+)?{n},?\s*$", m.group(1), re.MULTILINE) for n in names)
+    return ok
+
+
+def _defines(rx):
+    return lambda text: len(re.findall(rx, text, re.MULTILINE)) == 1
+
+
+REQUIRES = [
+    ("discord.js imports ButtonBuilder, ButtonStyle, ActionRowBuilder, Interaction",
+     _imports("ButtonBuilder", "ButtonStyle", "ActionRowBuilder", "Interaction")),
+    ("function loadAccess", _defines(r"^function loadAccess\(")),
+    ("const dmChannelUsers", _defines(r"^const dmChannelUsers = ")),
+    ("const MAX_CHUNK_LIMIT", _defines(r"^const MAX_CHUNK_LIMIT = ")),
+    ("const client", _defines(r"^const client = ")),
+    ("const mcp", _defines(r"^const mcp = ")),
+]
+
 # (name, anchor, mode, lines). The anchor's group 1 is the indent the lines
 # get; each anchor must match exactly once.
 STEPS = [
@@ -225,11 +260,19 @@ def tagged(indent, block):
 
 
 def patch_text(text):
-    """Returns (new_text, status): 'patched' | 'already' | 'native' | 'anchor-missing:<name>'."""
+    """Returns (new_text, status): 'patched' | 'upgraded' | 'already' | 'native' | 'anchor-missing:<name>'."""
     if TAG in text:
+        # Patched before. Take our lines out (byte-exact) and patch again, so a
+        # file patched by an older version of this script gets the current code.
+        fresh, status = patch_text(unpatch_text(text))
+        if status == "patched" and fresh != text:
+            return fresh, "upgraded"
         return text, "already"
     if NATIVE.search(text):
         return text, "native"
+    for name, ok in REQUIRES:
+        if not ok(text):
+            return text, f"anchor-missing:{name}"
     out = text
     for name, rx, mode, block in STEPS:
         found = list(rx.finditer(out))
@@ -260,7 +303,7 @@ def patch_file(path):
             "the buttons patch left out, the reply tool has no buttons")
     elif status == "native":
         log(f"{path}: the reply tool already has buttons -- left alone")
-    if status != "patched":
+    if status not in ("patched", "upgraded"):
         return status
     tmp = path + ".marveen-tmp"
     try:
@@ -274,8 +317,8 @@ def patch_file(path):
         except Exception:
             pass
         return "unwritable"
-    log(f"patched {path} (buttons)")
-    return "patched"
+    log(f"{status} {path} (buttons)")
+    return status
 
 
 def default_root():
